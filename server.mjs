@@ -44,7 +44,7 @@ function ensureDeck(game) {
 function publicState(room, socketId) {
   const game = room.game; if (!game) return null
   return {
-    current: game.current, direction: game.direction, deckCount: game.deck.length,
+    current: game.current, direction: game.direction, deckCount: game.deck.length, discardCount: game.discard.length,
     phase: game.phase, round: game.round, winner: game.winner,
     lastClaim: game.lastClaim && { playerId: game.lastClaim.playerId, rank: game.lastClaim.rank, count: game.lastClaim.count },
     log: game.log.slice(0, 8),
@@ -55,11 +55,29 @@ function publicState(room, socketId) {
     }))
   }
 }
-function emitRoom(room) { for (const player of room.players) io.to(player.id).emit('room:update', { code: room.code, hostId: room.hostId, status: room.status, players: room.players.map(({ id, name, avatar }) => ({ id, name, avatar })), game: publicState(room, player.id), chat: room.chat }) }
+function emitRoom(room) {
+  for (const player of room.players) {
+    io.to(player.id).emit('room:update', {
+      code: room.code, hostId: room.hostId, status: room.status,
+      reconnectToken: player.reconnectToken,
+      players: room.players.map(({ id, name, avatar }) => ({ id, name, avatar })),
+      game: publicState(room, player.id), chat: room.chat
+    })
+  }
+}
 function error(socket, message) { socket.emit('game:error', message) }
 function playerRoom(socket) { return socket.data.room && rooms.get(socket.data.room) }
-function leave(socket) {
+function leave(socket, immediate = false) {
   const room = playerRoom(socket); if (!room) return
+  const removedIndex = room.players.findIndex(player => player.id === socket.id)
+  if (removedIndex < 0) return
+  const removed = room.players[removedIndex]
+  if (!immediate) {
+    removed.disconnectTimer = setTimeout(() => {
+      if (removed.id === socket.id) leave(socket, true)
+    }, 30_000)
+    return
+  }
   room.players = room.players.filter(player => player.id !== socket.id)
   if (!room.players.length) rooms.delete(room.code)
   else {
@@ -72,7 +90,7 @@ function leave(socket) {
       } else {
         // Adjust current index if needed so it still points to a valid player
         if (room.game) {
-          if (room.game.current >= room.game.players.length) room.game.current = 0
+          if (removedIndex < room.game.current) room.game.current -= 1
           room.game.players = room.game.players.filter(p => p.id !== socket.id)
           if (room.game.current >= room.game.players.length) room.game.current = 0
           // If it was that player's turn, move to next
@@ -88,11 +106,25 @@ function leave(socket) {
 }
 
 io.on('connection', socket => {
+  socket.on('room:reconnect', ({ code, token } = {}) => {
+    const room = rooms.get(String(code || '').toUpperCase().trim())
+    const player = room?.players.find(item => item.reconnectToken === token)
+    if (!room || !player) return error(socket, 'Your previous table is no longer available.')
+    clearTimeout(player.disconnectTimer)
+    const previousId = player.id
+    player.id = socket.id
+    room.hostId = room.hostId === previousId ? socket.id : room.hostId
+    room.game?.players.forEach(gamePlayer => { if (gamePlayer.id === previousId) gamePlayer.id = socket.id })
+    if (room.game?.lastClaim?.playerId === previousId) room.game.lastClaim.playerId = socket.id
+    socket.join(room.code); socket.data.room = room.code
+    emitRoom(room)
+  })
+
   socket.on('room:create', ({ name } = {}) => {
     const cleanName = String(name || '').trim().slice(0, 18)
     if (!cleanName) return error(socket, 'Choose a display name first.')
     const code = roomCode()
-    const room = { code, hostId: socket.id, status: 'lobby', players: [{ id: socket.id, name: cleanName, avatar: avatars[0] }], game: null, chat: [] }
+    const room = { code, hostId: socket.id, status: 'lobby', players: [{ id: socket.id, name: cleanName, avatar: avatars[0], reconnectToken: crypto.randomUUID() }], game: null, chat: [] }
     rooms.set(code, room); socket.join(code); socket.data.room = code; emitRoom(room)
   })
 
@@ -103,7 +135,7 @@ io.on('connection', socket => {
     if (room.status !== 'lobby') return error(socket, 'This game has already started.')
     if (!cleanName) return error(socket, 'Choose a display name first.')
     if (room.players.length >= 8) return error(socket, 'This table is full (8 players max).')
-    room.players.push({ id: socket.id, name: cleanName, avatar: avatars[room.players.length % avatars.length] })
+    room.players.push({ id: socket.id, name: cleanName, avatar: avatars[room.players.length % avatars.length], reconnectToken: crypto.randomUUID() })
     socket.join(room.code); socket.data.room = room.code; emitRoom(room)
   })
 
@@ -175,6 +207,6 @@ io.on('connection', socket => {
     room.chat = room.chat.slice(0, 20); emitRoom(room)
   })
 
-  socket.on('room:leave', () => leave(socket)); socket.on('disconnect', () => leave(socket))
+  socket.on('room:leave', () => leave(socket, true)); socket.on('disconnect', () => leave(socket))
 })
 httpServer.listen(process.env.PORT || 3001, () => console.log('VEIL multiplayer server listening on http://localhost:3001'))
