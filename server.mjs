@@ -41,6 +41,9 @@ function ensureDeck(game) {
     game.log.unshift('Deck exhausted — discards reshuffled.')
   }
 }
+function claimIsTruthful(claim) {
+  return claim.cards.every(card => card.special ? card.special === 'WILD' : card.rank === claim.rank)
+}
 function publicState(room, socketId) {
   const game = room.game; if (!game) return null
   return {
@@ -166,12 +169,13 @@ io.on('connection', socket => {
     if (!game || !claim || game.phase !== 'respond' || game.players[game.current].id !== socket.id) return error(socket, 'It is not your decision.')
     let result = 'Claim accepted.'
     if (callBluff) {
-      const truthful = claim.cards.every(card => card.rank === claim.rank || card.special === 'WILD')
+      const truthful = claimIsTruthful(claim)
       const loser = truthful ? game.players[game.current] : game.players.find(player => player.id === claim.playerId)
+      if (!loser) return error(socket, 'The challenged player is no longer at the table.')
+      game.discard.push(...claim.cards)
       ensureDeck(game)
       const count = loser.shield ? 1 : 2
       loser.hand.push(...game.deck.splice(0, count))
-      // Add drawn cards to discard tracking doesn't apply here — discard is for played cards
       loser.shield = false
       result = truthful ? `${loser.name} challenged truth and draws ${count}.` : `${loser.name} was caught bluffing and draws ${count}.`
     } else {
